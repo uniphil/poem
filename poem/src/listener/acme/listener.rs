@@ -333,6 +333,25 @@ pub async fn issue_cert<T: AsRef<str>>(
         return Err(IoError::other("authorization failed too many times"));
     }
 
+    // send csr
+    let mut params = CertificateParams::new(
+        domains
+            .iter()
+            .map(|domain| domain.as_ref().to_string())
+            .collect::<Vec<_>>(),
+    );
+    params.distinguished_name = DistinguishedName::new();
+    params.alg = &PKCS_ECDSA_P256_SHA256;
+    let cert = Certificate::from_params(params)
+        .map_err(|err| IoError::other(format!("failed create certificate request: {err}")))?;
+    let pk = any_ecdsa_type(&PrivateKeyDer::Pkcs8(
+        cert.serialize_private_key_der().into(),
+    ))
+    .unwrap();
+    let csr = cert
+        .serialize_request_der()
+        .map_err(|err| IoError::other(format!("failed to serialize request der {err}")))?;
+
     // poll the finalization: letsencrypt prod is synchronous, but LE staging is
     // async and uses "processing" status, as do other ACME providers
     // https://community.letsencrypt.org/t/enabling-asynchronous-order-finalization/193522/8
@@ -341,26 +360,6 @@ pub async fn issue_cert<T: AsRef<str>>(
     let order_resp = loop {
         attempt += 1;
         tracing::debug!(attempt=%attempt, "attempting to finalize");
-
-        // send csr
-        let mut params = CertificateParams::new(
-            domains
-                .iter()
-                .map(|domain| domain.as_ref().to_string())
-                .collect::<Vec<_>>(),
-        );
-        params.distinguished_name = DistinguishedName::new();
-        params.alg = &PKCS_ECDSA_P256_SHA256;
-        let cert = Certificate::from_params(params)
-            .map_err(|err| IoError::other(format!("failed create certificate request: {err}")))?;
-        let pk = any_ecdsa_type(&PrivateKeyDer::Pkcs8(
-            cert.serialize_private_key_der().into(),
-        ))
-        .unwrap();
-        let csr = cert
-            .serialize_request_der()
-            .map_err(|err| IoError::other(format!("failed to serialize request der {err}")))?;
-
         let resp = client.send_csr(&order_resp.finalize, &csr).await?;
 
         match resp.status.as_ref() {
