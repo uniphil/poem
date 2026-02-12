@@ -352,25 +352,44 @@ pub async fn issue_cert<T: AsRef<str>>(
         .serialize_request_der()
         .map_err(|err| IoError::other(format!("failed to serialize request der {err}")))?;
 
-    let order_resp = client.send_csr(&order_resp.finalize, &csr).await?;
+    // poll the finalization: letsencrypt prod is synchronous, but LE staging is
+    // async and uses "processing" status, as do other ACME providers
+    // https://community.letsencrypt.org/t/enabling-asynchronous-order-finalization/193522/8
+    let finalize_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
+    let order_resp = loop {
+        let resp = client.send_csr(&order_resp.finalize, &csr).await?;
 
-    if order_resp.status == "invalid" {
-        return Err(IoError::other(format!(
-            "failed to request certificate: {}",
-            order_resp
-                .error
-                .as_ref()
-                .map(|problem| &*problem.detail)
-                .unwrap_or("unknown")
-        )));
-    }
-
-    if order_resp.status != "valid" {
-        return Err(IoError::other(format!(
-            "failed to request certificate: unexpected status `{}`",
-            order_resp.status
-        )));
-    }
+        match resp.status.as_ref() {
+            "valid" => break resp,
+            "processing" => {
+                // TODO: should check `retry-after` header if present, like certbot
+                // https://github.com/certbot/certbot/blob/8ae17fd174622db7b6df710d5b3281db88195e15/acme/src/acme/client.py#L548
+                let retry_at = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+                if retry_at > finalize_deadline {
+                    return Err(IoError::other(format!(
+                        "failed to request finalized certificate: processing after 90s deadline",
+                    )));
+                }
+                tokio::time::sleep_until(retry_at);
+                continue;
+            }
+            "invalid" => {
+                return Err(IoError::other(format!(
+                    "failed to request certificate: {}",
+                    resp
+                        .error
+                        .as_ref()
+                        .map(|problem| &*problem.detail)
+                        .unwrap_or("unknown")
+                )));
+            }
+            other => {
+                return Err(IoError::other(format!(
+                    "failed to request certificate: unexpected status `{other}`",
+                )));
+            }
+        }
+    };
 
     // download certificate
     let acme_cert_pem = client
