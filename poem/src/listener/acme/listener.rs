@@ -429,16 +429,8 @@ pub async fn issue_cert<T: AsRef<str>>(
             }
         };
 
-
-        // 2. poll the order status
-        //      - "pending": bad
-        //      - "ready": goto 1 (weird but ok)
-        //      - "processing": wait a sec and goto 2 (TODO: retry-after)
-        //      - "valid": we're set, break out
-        //      - "invalid" or anything else: bail
-
         'poll_status: loop {
-            let resp = client.send_csr(&order_location, &csr).await?;
+            let resp = client.check_order(&order_location).await?;
             match resp.status.as_ref() {
                 "pending" => {
                     return Err(IoError::other("order pending when polling status (all authzs should be done)"));

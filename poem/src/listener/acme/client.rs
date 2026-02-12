@@ -166,6 +166,21 @@ impl AcmeClient {
         .await
     }
 
+    pub(crate) async fn check_order(&self, location: &str) -> IoResult<NewOrderResponse> {
+        tracing::debug!(location = %location, "check order");
+
+        let nonce = get_nonce(&self.client, &self.directory).await?;
+        jose::request_json(
+            &self.client,
+            &self.key_pair,
+            self.kid.as_deref(),
+            &nonce,
+            location,
+            None::<()>,
+        )
+        .await
+    }
+
     pub(crate) async fn obtain_certificate(&self, url: &str) -> IoResult<Vec<u8>> {
         tracing::debug!(url = %url, "send certificate request");
 
