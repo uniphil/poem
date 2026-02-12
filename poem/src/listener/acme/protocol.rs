@@ -110,3 +110,25 @@ impl FetchAuthorizationResponse {
 pub(crate) struct CsrRequest {
     pub(crate) csr: String,
 }
+
+/// simplified representation for acme problems as rfc7807 problem docs
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProblemDocument {
+    /// expected (not required) to be in `urn:ietf:params:acme:error:` namespace
+    #[serde(default = "prob_doc_about_blank")] // https://www.rfc-editor.org/rfc/rfc7807#section-3.1
+    pub(crate) r#type: String,
+    /// > Clients SHOULD display the "detail" field of all errors.
+    pub(crate) detail: Option<String>,
+    // problem document extensions ignored
+}
+fn prob_doc_about_blank() -> String {
+    "about:blank".to_string()
+}
+impl std::fmt::Display for ProblemDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+        let detail = self.detail.as_deref().unwrap_or("(no detail)");
+        write!(f, "Problem[{}: {detail}]", self.r#type)
+    }
+}
+impl std::error::Error for ProblemDocument {}

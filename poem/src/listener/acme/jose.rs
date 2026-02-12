@@ -6,6 +6,7 @@ use ring::digest::{Digest, SHA256, digest};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::listener::acme::keypair::KeyPair;
+use crate::listener::acme::protocol::ProblemDocument;
 
 #[derive(Serialize)]
 struct Protected<'a> {
@@ -148,11 +149,33 @@ pub(crate) async fn request(
 
     let status = resp.status();
     if !status.is_success() {
-        let text = resp.text().await.unwrap();
-        tracing::trace!(body=%text, "non-success response");
-        return Err(IoError::other(format!("unexpected status code: status = {status}")));
+        tracing::trace!(status=%status, "non-success response");
+        // When the server responds with an error status, it SHOULD provide
+        // additional information using a problem document [RFC7807].
+        // https://www.rfc-editor.org/rfc/rfc8555.html#section-6.7
+        let problem_data = resp
+            .text()
+            .await
+            .map_err(|_| IoError::other(format!("unexpected status code: status = {status}")))?;
+
+        // fall back on the normal error if we can't get the json as a problem doc
+        let doc: ProblemDocument = json(&problem_data)
+            .map_err(|_| IoError::other(format!("unexpected status code: status = {status}")))?;
+
+        return Err(IoError::other(doc));
     }
     Ok(resp)
+}
+
+pub(crate) fn json<T: DeserializeOwned>(data: &str) -> IoResult<T> {
+    #[cfg(not(feature = "sonic-rs"))]
+    {
+        serde_json::from_str(&data).map_err(|err| IoError::other(format!("bad json: {err}")))
+    }
+    #[cfg(feature = "sonic-rs")]
+    {
+        sonic_rs::from_str(&data).map_err(|err| IoError::other(format!("bad json: {err}")))
+    }
 }
 
 pub(crate) async fn request_json<T, R>(
@@ -167,20 +190,12 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
-    let resp = request(cli, key_pair, kid, nonce, uri, payload).await?;
-
-    let data = resp
+    request(cli, key_pair, kid, nonce, uri, payload)
+        .await?
         .text()
         .await
-        .map_err(|_| IoError::other("failed to read response"))?;
-    #[cfg(not(feature = "sonic-rs"))]
-    {
-        serde_json::from_str(&data).map_err(|err| IoError::other(format!("bad response: {err}")))
-    }
-    #[cfg(feature = "sonic-rs")]
-    {
-        sonic_rs::from_str(&data).map_err(|err| IoError::other(format!("bad response: {err}")))
-    }
+        .map_err(|_| IoError::other("failed to read response"))
+        .and_then(|t| json(&t))
 }
 
 pub(crate) fn key_authorization(key: &KeyPair, token: &str) -> IoResult<String> {

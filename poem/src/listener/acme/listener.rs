@@ -27,6 +27,7 @@ use crate::{
             AutoCert, ChallengeType, Http01TokensMap,
             client::AcmeClient,
             jose,
+            protocol::ProblemDocument,
             resolver::{ACME_TLS_ALPN_NAME, ResolveServerCert},
         },
     },
@@ -263,7 +264,7 @@ pub async fn issue_cert<T: AsRef<str>>(
     keys_for_http01: Option<&Http01TokensMap>,
 ) -> IoResult<IssueCertResult> {
     tracing::debug!("issue certificate");
-    let order_resp = client.new_order(domains).await?;
+    let (order_resp, order_location) = client.new_order(domains).await?;
 
     // trigger challenge
     let mut valid = false;
@@ -355,42 +356,118 @@ pub async fn issue_cert<T: AsRef<str>>(
     // poll the finalization: letsencrypt prod is synchronous, but LE staging is
     // async and uses "processing" status, as do other ACME providers
     // https://community.letsencrypt.org/t/enabling-asynchronous-order-finalization/193522/8
-    let finalize_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
-    let mut attempt = 0;
-    let order_resp = loop {
-        attempt += 1;
-        tracing::debug!(attempt=%attempt, "attempting to finalize");
-        let resp = client.send_csr(&order_resp.finalize, &csr).await?;
+    //
+    // see the "typical sequence of requests" at
+    // https://www.rfc-editor.org/rfc/rfc8555.html#section-7.1
 
-        match resp.status.as_ref() {
-            "valid" => break resp,
-            "processing" => {
-                tracing::debug!("server is still processing finalization");
-                // TODO: should check `retry-after` header if present, like certbot
-                // https://github.com/certbot/certbot/blob/8ae17fd174622db7b6df710d5b3281db88195e15/acme/src/acme/client.py#L548
-                let retry_at = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
-                if retry_at > finalize_deadline {
+    // it's fun because you have to go back and forth between order and finalization
+    //
+    // 1. hit the finalize endpoint
+    //      - if it succeeds with "pending", something probably went wrong? authorizations not completed?
+    //      - if it succeeds with "ready" then something's really messed up
+    //      - if it succeeds with "processing", goto 2 after a sec (TODO: retry-after)
+    //      - if it succeeds with "valid", we're set, break out
+    //      - if it errors with ..:orderNotReady, goto 2
+    //      - for any other error, bail
+    // 2. poll the order status
+    //      - "pending": bad
+    //      - "ready": goto 1 (weird but ok)
+    //      - "processing": wait a sec and goto 2 (TODO: retry-after)
+    //      - "valid": we're set, break out
+    //      - "invalid" or anything else: bail
+
+    let mut finalisms = 0;
+    let finalize_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
+
+    let order_resp = 'finalize: loop {
+        finalisms += 1;
+        tracing::debug!(finalisms=%finalisms, "attempting to finalize");
+
+        // 1. hit finalization endpoint
+        match client
+            .send_csr(&order_resp.finalize, &csr)
+            .await
+            .map_err(|e| e.downcast::<ProblemDocument>())
+        {
+            Err(Ok(prob)) if prob.r#type == "urn:ietf:params:acme:error:orderNotReady" => {
+                if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
+                    return Err(IoError::other(format!(
+                        "failed to request finalized certificate: orderNotReady after 90s deadline",
+                    )));
+                }
+                // drop down to polling status
+            }
+            Err(Ok(other_prob)) => return Err(IoError::other(other_prob)),
+            Err(Err(e)) => return Err(e),
+            Ok(r) if r.status == "pending" => {
+                return Err(IoError::other("order pending when trying to finalize"));
+            }
+            Ok(r) if r.status == "ready" => {
+                tracing::warn!("very unexpected 'ready' status after finalizing?? gonna try finalizing again.");
+                if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
+                    return Err(IoError::other(format!(
+                        "failed to request finalized certificate: need to finalize after 90s deadline",
+                    )));
+                }
+                continue 'finalize;
+            }
+            Ok(r) if r.status == "processing" => {
+                if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
                     return Err(IoError::other(format!(
                         "failed to request finalized certificate: processing after 90s deadline",
                     )));
                 }
-                tokio::time::sleep_until(retry_at);
-                continue;
             }
-            "invalid" => {
+            Ok(r) if r.status == "valid" => {
+                break 'finalize r;
+            }
+            Ok(r) => {
                 return Err(IoError::other(format!(
-                    "failed to request certificate: {}",
-                    resp
-                        .error
-                        .as_ref()
-                        .map(|problem| &*problem.detail)
-                        .unwrap_or("unknown")
+                    "unexpected order status when finalizing: {}",
+                    r.status,
                 )));
             }
-            other => {
-                return Err(IoError::other(format!(
-                    "failed to request certificate: unexpected status `{other}`",
-                )));
+        };
+
+
+        // 2. poll the order status
+        //      - "pending": bad
+        //      - "ready": goto 1 (weird but ok)
+        //      - "processing": wait a sec and goto 2 (TODO: retry-after)
+        //      - "valid": we're set, break out
+        //      - "invalid" or anything else: bail
+
+        'poll_status: loop {
+            let resp = client.send_csr(&order_location, &csr).await?;
+            match resp.status.as_ref() {
+                "pending" => {
+                    return Err(IoError::other("order pending when polling status (all authzs should be done)"));
+                }
+                "ready" => {
+                    tracing::trace!("status poll putting us back to finalize? weird but ok.");
+                    if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
+                        return Err(IoError::other(format!(
+                            "failed to request finalized certificate: need to finalize after 90s deadline",
+                        )));
+                    }
+                    continue 'finalize;
+                }
+                "processing" => {
+                    if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
+                        return Err(IoError::other(format!(
+                            "failed to request finalized certificate: awaiting processing after 90s deadline",
+                        )));
+                    }
+                    continue 'poll_status;
+                }
+                "valid" => {
+                    break 'finalize resp;
+                }
+                other => {
+                    return Err(IoError::other(format!(
+                        "unexpected order status when polling order status: {other}",
+                    )));
+                }
             }
         }
     };
@@ -418,4 +495,13 @@ pub async fn issue_cert<T: AsRef<str>>(
         public_pem: acme_cert_pem,
         rustls_key: Arc::new(cert_key),
     })
+}
+
+async fn pause_within_deadline(deadline: tokio::time::Instant, duration: tokio::time::Duration) -> bool {
+    let until = tokio::time::Instant::now() + duration;
+    if until > deadline {
+        return false;
+    }
+    tokio::time::sleep_until(until).await;
+    true
 }

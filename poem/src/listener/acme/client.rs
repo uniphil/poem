@@ -11,7 +11,7 @@ use crate::listener::acme::{
     keypair::KeyPair,
     protocol::{
         CsrRequest, Directory, FetchAuthorizationResponse, Identifier, NewAccountRequest,
-        NewOrderRequest, NewOrderResponse,
+        NewOrderRequest, NewOrderResponse
     },
 };
 
@@ -43,7 +43,7 @@ impl AcmeClient {
     pub(crate) async fn new_order<T: AsRef<str>>(
         &mut self,
         domains: &[T],
-    ) -> IoResult<NewOrderResponse> {
+    ) -> IoResult<(NewOrderResponse, String)> {
         let kid = match &self.kid {
             Some(kid) => kid,
             None => {
@@ -63,7 +63,7 @@ impl AcmeClient {
         tracing::debug!(kid = kid.as_str(), "new order request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
-        let resp: NewOrderResponse = jose::request_json(
+        let resp = jose::request(
             &self.client,
             &self.key_pair,
             Some(kid),
@@ -81,8 +81,19 @@ impl AcmeClient {
         )
         .await?;
 
-        tracing::debug!(status = resp.status.as_str(), "order created");
-        Ok(resp)
+        let order_location = resp
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+            .ok_or_else(|| IoError::other("unable to get order location"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|_| IoError::other("failed to read response"))?;
+        let data: NewOrderResponse = jose::json(&text)?;
+
+        tracing::debug!(status=%status, "order created");
+        Ok((data, order_location))
     }
 
     pub(crate) async fn fetch_authorization(
