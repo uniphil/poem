@@ -146,11 +146,11 @@ pub(crate) async fn request(
         .await
         .map_err(|err| IoError::other(format!("failed to send http request: {err}")))?;
 
-    if !resp.status().is_success() {
-        return Err(IoError::other(format!(
-            "unexpected status code: status = {}",
-            resp.status()
-        )));
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap();
+        tracing::trace!(body=%text, "non-success response");
+        return Err(IoError::other(format!("unexpected status code: status = {status}")));
     }
     Ok(resp)
 }

@@ -360,6 +360,7 @@ pub async fn issue_cert<T: AsRef<str>>(
         let csr = cert
             .serialize_request_der()
             .map_err(|err| IoError::other(format!("failed to serialize request der {err}")))?;
+
         let resp = client.send_csr(&order_resp.finalize, &csr).await?;
 
         match resp.status.as_ref() {
