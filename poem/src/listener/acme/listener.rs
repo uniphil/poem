@@ -356,12 +356,16 @@ pub async fn issue_cert<T: AsRef<str>>(
     // async and uses "processing" status, as do other ACME providers
     // https://community.letsencrypt.org/t/enabling-asynchronous-order-finalization/193522/8
     let finalize_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
+    let mut attempt = 0;
     let order_resp = loop {
+        attempt += 1;
+        tracing::debug!(attempt=%attempt, "attempting to finalize");
         let resp = client.send_csr(&order_resp.finalize, &csr).await?;
 
         match resp.status.as_ref() {
             "valid" => break resp,
             "processing" => {
+                tracing::debug!("server is still processing finalization");
                 // TODO: should check `retry-after` header if present, like certbot
                 // https://github.com/certbot/certbot/blob/8ae17fd174622db7b6df710d5b3281db88195e15/acme/src/acme/client.py#L548
                 let retry_at = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
@@ -390,6 +394,7 @@ pub async fn issue_cert<T: AsRef<str>>(
             }
         }
     };
+    tracing::debug!("finalization succeeded.");
 
     // download certificate
     let acme_cert_pem = client
