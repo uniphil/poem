@@ -390,6 +390,7 @@ pub async fn issue_cert<T: AsRef<str>>(
             .map_err(|e| e.downcast::<ProblemDocument>())
         {
             Err(Ok(prob)) if prob.r#type == "urn:ietf:params:acme:error:orderNotReady" => {
+                tracing::trace!("finalize errored with orderNotReady, going back to polling");
                 if !pause_within_deadline(finalize_deadline, tokio::time::Duration::from_secs(1)).await {
                     return Err(IoError::other(format!(
                         "failed to request finalized certificate: orderNotReady after 90s deadline",
@@ -397,8 +398,14 @@ pub async fn issue_cert<T: AsRef<str>>(
                 }
                 // drop down to polling status
             }
-            Err(Ok(other_prob)) => return Err(IoError::other(other_prob)),
-            Err(Err(e)) => return Err(e),
+            Err(Ok(other_prob)) => {
+                tracing::trace!(r#type=%other_prob.r#type, "finalize errored with another problem");
+                return Err(IoError::other(other_prob));
+            }
+            Err(Err(e)) => {
+                tracing::trace!(err=%e, "finalize errored with something else");
+                return Err(e);
+            }
             Ok(r) if r.status == "pending" => {
                 return Err(IoError::other("order pending when trying to finalize"));
             }
